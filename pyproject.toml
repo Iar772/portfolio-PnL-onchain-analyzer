@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "portfolio-PnL-onchain-analyzer"
+version = "0.1.0"
+description = "Transparent Ethereum-first portfolio, cost-basis, and PnL engine"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+]
+# Runtime dependencies are added only when the corresponding feature exists.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<10",
+    "pytest-asyncio>=1.0,<2",
+    "ruff>=0.11,<1",
+    "mypy>=1.15,<2",
+    "pre-commit>=4,<5",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["portfolio_analyzer*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+show_error_codes = true
+warn_unused_configs = true
+files = ["src", "tests"]
