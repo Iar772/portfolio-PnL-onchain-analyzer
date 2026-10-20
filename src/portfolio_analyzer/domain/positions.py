@@ -6,11 +6,11 @@ from decimal import ROUND_HALF_EVEN, Context, Decimal, localcontext
 
 from portfolio_analyzer.domain.assets import AssetId
 from portfolio_analyzer.domain.lots import Lot
-from portfolio_analyzer.domain.money import UsdAmount
+from portfolio_analyzer.domain.money import UsdAmount, UsdPrice
 
 # Ratios such as 1/3 cannot be represented exactly as finite decimals.
-# Keep ratio math reproducible; UI percent formatting belongs elsewhere.
-_COVERAGE_CONTEXT = Context(prec=50, rounding=ROUND_HALF_EVEN)
+# Keep ratio math reproducible; UI rounding belongs elsewhere.
+_RATIO_CONTEXT = Context(prec=50, rounding=ROUND_HALF_EVEN)
 
 
 def _sum_exact(values: Iterable[Decimal]) -> Decimal:
@@ -130,10 +130,27 @@ class Position:
 
         :return: Known quantity divided by total quantity, or None if empty.
         """
-        with localcontext(_COVERAGE_CONTEXT):
+        with localcontext(_RATIO_CONTEXT):
             total = self.total_quantity
-
             if total == 0:
                 return None
-
             return self.known_quantity / total
+
+    @property
+    def average_entry(self) -> UsdPrice | None:
+        """Calculate USD entry price per token for the known portion only.
+
+        Unknown-basis lots never contribute to the numerator or denominator.
+        The ratio is not rounded for presentation inside the domain.
+
+        :return: Known-portion USD entry price, or None with no known inventory.
+        """
+        known_quantity = self.known_quantity
+        if known_quantity == 0:
+            return None
+
+        known_basis = self.known_cost_basis
+        assert known_basis is not None
+
+        with localcontext(_RATIO_CONTEXT):
+            return UsdPrice(known_basis.value / known_quantity)
