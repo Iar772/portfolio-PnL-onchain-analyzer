@@ -32,7 +32,7 @@ class AppConfig:
         normalized_log_level = self.log_level.upper().strip()
 
         if normalized_log_level not in _ALLOWED_LOG_LEVELS:
-            f"LOG_LEVEL must be one of: {', '.join(sorted(_ALLOWED_LOG_LEVELS))}"
+            raise ValueError(f"LOG_LEVEL must be one of: {', '.join(sorted(_ALLOWED_LOG_LEVELS))}")
 
         object.__setattr__(self, "log_level", normalized_log_level)
 
