@@ -9,6 +9,7 @@ from portfolio_analyzer.ethereum.direct_transfer_rules import (
     _assert_same_transaction,
     _is_direct_erc20_transfer,
 )
+from portfolio_analyzer.ethereum.known_contracts import MAINNET_WETH9
 from portfolio_analyzer.ethereum.movements import MovementCategory
 from portfolio_analyzer.ethereum.normalizer import (
     EthereumNormalizationError,
@@ -82,6 +83,9 @@ def classify_transfer_out(
             or transaction.value_wei != movement.raw_amount
             or transaction.input_data
             or receipt.logs
+            # An ETH payment to canonical WETH9 may execute its deposit fallback.
+            # If its receipt logs are unavailable, it is still not provably a gift.
+            or transaction.to_address.lower() == MAINNET_WETH9.contract_address
         ):
             return None
         metadata = _NATIVE_METADATA
