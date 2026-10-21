@@ -19,7 +19,7 @@ from portfolio_analyzer.application.ports import (
 from portfolio_analyzer.application.provider_models import PriceQuote
 from portfolio_analyzer.domain.assets import AssetAmount, AssetId, AssetMetadata
 from portfolio_analyzer.domain.money import UsdPrice
-from portfolio_analyzer.ethereum.models import EthereumTransaction
+from portfolio_analyzer.ethereum.movements import AssetMovement, MovementCategory
 from portfolio_analyzer.ethereum.rpc_models import RpcBlock, RpcReceipt, RpcTransaction
 
 _ETH = AssetId(chain_id=1, contract_address=None)
@@ -91,13 +91,25 @@ class FakeRpc:
 class FakeHistory:
     """Return provider-neutral transactions from memory."""
 
-    async def get_history(self, address: str) -> list[EthereumTransaction]:
+    async def get_history(self, address: str) -> list[AssetMovement]:
         """Return a deterministic transaction history.
 
         :param address: Wallet address ignored by this single-wallet fake.
         :return: One internal transaction envelope.
         """
-        return [EthereumTransaction("0x" + "ab" * 32, 99, _AT)]
+        return [
+            AssetMovement(
+                transfer_id="fake:1",
+                tx_hash="0x" + "ab" * 32,
+                block_number=99,
+                timestamp=_AT,
+                from_address="0x" + "11" * 20,
+                to_address="0x" + "22" * 20,
+                asset_id=_ETH,
+                raw_amount=10**18,
+                category=MovementCategory.EXTERNAL,
+            )
+        ]
 
 
 class FakeBalances:

@@ -5,7 +5,7 @@ from typing import Protocol
 
 from portfolio_analyzer.application.provider_models import PriceQuote
 from portfolio_analyzer.domain.assets import AssetAmount, AssetId, AssetMetadata
-from portfolio_analyzer.ethereum.models import EthereumTransaction
+from portfolio_analyzer.ethereum.movements import AssetMovement
 from portfolio_analyzer.ethereum.rpc_models import RpcBlock, RpcReceipt, RpcTransaction
 
 
@@ -71,13 +71,13 @@ class RpcProvider(Protocol):
 
 
 class HistoryProvider(Protocol):
-    """Retrieve Ethereum transaction history as provider-neutral models."""
+    """Retrieve complete Ethereum asset movements using our internal models."""
 
-    async def get_history(self, address: str) -> list[EthereumTransaction]:
-        """Load transactions related to an Ethereum wallet.
+    async def get_history(self, address: str) -> list[AssetMovement]:
+        """Load native ETH and ERC-20 movements for an Ethereum wallet.
 
         :param address: Ethereum wallet address to analyze.
-        :return: Transactions mapped to our own Ethereum models.
+        :return: Fully paginated movements with raw on-chain quantities.
         """
         ...
 
