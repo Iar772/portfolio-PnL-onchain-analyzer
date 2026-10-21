@@ -20,6 +20,7 @@ from portfolio_analyzer.application.provider_models import PriceQuote
 from portfolio_analyzer.domain.assets import AssetAmount, AssetId, AssetMetadata
 from portfolio_analyzer.domain.money import UsdPrice
 from portfolio_analyzer.ethereum.models import EthereumTransaction
+from portfolio_analyzer.ethereum.rpc_models import RpcBlock, RpcReceipt, RpcTransaction
 
 _ETH = AssetId(chain_id=1, contract_address=None)
 _TOKEN = AssetId(chain_id=1, contract_address="0x" + "11" * 20)
@@ -42,6 +43,49 @@ class FakeRpc:
         :return: A deterministic test block height.
         """
         return 100
+
+    async def get_balance(self, address: str, *, at_block: int | None = None) -> AssetAmount:
+        """Return a fixed ETH balance from the fake RPC interface.
+
+        :param address: Ignored wallet address.
+        :param at_block: Optional historical block.
+        :return: Native ETH holding of two units.
+        """
+        return AssetAmount(_ETH, Decimal("2"))
+
+    async def get_transaction_by_hash(self, tx_hash: str) -> RpcTransaction | None:
+        """Return no transaction for this minimal in-memory fake.
+
+        :param tx_hash: Requested transaction hash.
+        :return: No transaction.
+        """
+        return None
+
+    async def get_transaction_receipt(self, tx_hash: str) -> RpcReceipt | None:
+        """Return no receipt for this minimal in-memory fake.
+
+        :param tx_hash: Requested transaction hash.
+        :return: No receipt.
+        """
+        return None
+
+    async def get_block(self, block_number: int) -> RpcBlock | None:
+        """Return a timestamped fake block.
+
+        :param block_number: Requested height.
+        :return: Deterministic block facts.
+        """
+        return RpcBlock(block_number, _AT)
+
+    async def eth_call(self, to_address: str, data: bytes, *, at_block: int | None = None) -> bytes:
+        """Return raw bytes for an imaginary contract read.
+
+        :param to_address: Target address.
+        :param data: Raw calldata.
+        :param at_block: Optional historical height.
+        :return: Empty ABI return data.
+        """
+        return b""
 
 
 class FakeHistory:
