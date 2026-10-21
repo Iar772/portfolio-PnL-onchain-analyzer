@@ -249,6 +249,7 @@ class AlchemyRpcProvider:
             raise ValueError("timeout/backoff must be finite and nonnegative")
         self._client = client
         self._url = f"https://eth-mainnet.g.alchemy.com/v2/{api_key}"
+        self._prices_url = f"https://api.g.alchemy.com/prices/v1/{api_key}/tokens"
         self._timeout = float(request_timeout)
         self._semaphore = asyncio.Semaphore(max_concurrency)
         self._max_attempts = max_attempts
@@ -257,32 +258,28 @@ class AlchemyRpcProvider:
         self._sleep = sleep
         self._request_ids = itertools.count(1)
 
-    async def _request(self, method: str, params: list[object], *, operation: str) -> object:
-        """Send one logical read with bounded retry and sanitized errors.
+    async def _execute_http(
+        self,
+        *,
+        operation: str,
+        send: Callable[[], Awaitable[httpx.Response]],
+        decode: Callable[[httpx.Response], object],
+    ) -> object:
+        """Apply one bounded request/retry policy to RPC and Prices APIs.
 
-        :param method: Controlled JSON-RPC method name.
-        :param params: JSON-serializable RPC method parameters.
-        :param operation: Safe operation identifier for errors.
-        :return: Validated JSON-RPC result field.
-        :raises ProviderError: If transport, JSON or RPC validation fails.
+        :param operation: Safe internal operation name.
+        :param send: One HTTP attempt, borrowing the shared client.
+        :param decode: Validate a successful response without exposing payloads.
+        :return: Validated vendor result for the infrastructure caller.
+        :raises ProviderError: For exhausted attempts or invalid responses.
         """
         for attempt in range(1, self._max_attempts + 1):
-            request_id = next(self._request_ids)
             started = time.perf_counter()
             context = {"provider": "alchemy", "operation": operation, "attempt": attempt}
             _LOGGER.debug("provider_request_started", extra=context)
             try:
                 async with self._semaphore:
-                    response = await self._client.post(
-                        self._url,
-                        json={
-                            "jsonrpc": "2.0",
-                            "id": request_id,
-                            "method": method,
-                            "params": params,
-                        },
-                        timeout=self._timeout,
-                    )
+                    response = await asyncio.wait_for(send(), timeout=self._timeout)
                 if response.status_code == 429:
                     raise ProviderRateLimitError("alchemy", operation)
                 if response.status_code in (408, 504):
@@ -291,22 +288,7 @@ class AlchemyRpcProvider:
                     raise ProviderUnavailableError("alchemy", operation)
                 if response.status_code >= 400:
                     raise ProviderError("alchemy", operation)
-                try:
-                    payload: object = response.json()
-                except (json.JSONDecodeError, ValueError):
-                    raise ProviderMalformedResponseError("alchemy", operation) from None
-                data = _mapping(payload, operation=operation)
-                if data.get("jsonrpc") != "2.0" or type(data.get("id")) is not int:
-                    raise ProviderMalformedResponseError("alchemy", operation)
-                if data["id"] != request_id:
-                    raise ProviderMalformedResponseError("alchemy", operation)
-                if "error" in data:
-                    rpc_error = _mapping(data["error"], operation=operation)
-                    if rpc_error.get("code") == -32005:
-                        raise ProviderRateLimitError("alchemy", operation)
-                    raise ProviderError("alchemy", operation)
-                if "result" not in data:
-                    raise ProviderMalformedResponseError("alchemy", operation)
+                result = decode(response)
                 _LOGGER.debug(
                     "provider_request_completed",
                     extra={
@@ -314,8 +296,8 @@ class AlchemyRpcProvider:
                         "duration_ms": max(0, int((time.perf_counter() - started) * 1000)),
                     },
                 )
-                return data["result"]
-            except httpx.TimeoutException:
+                return result
+            except (httpx.TimeoutException, TimeoutError):
                 failure: ProviderError = ProviderTimeoutError("alchemy", operation)
             except httpx.TransportError:
                 failure = ProviderUnavailableError("alchemy", operation)
@@ -334,7 +316,91 @@ class AlchemyRpcProvider:
             _LOGGER.warning("provider_request_retry", extra=failure_context)
             delay = min(self._max_backoff, self._base_backoff * 2 ** (attempt - 1))
             await self._sleep(delay)
-        raise AssertionError("Unreachable: bounded RPC retry loop exhausted")
+        raise AssertionError("Unreachable: bounded HTTP retry loop exhausted")
+
+    async def _request(self, method: str, params: list[object], *, operation: str) -> object:
+        """Send a JSON-RPC request through shared, bounded HTTP handling.
+
+        :param method: Controlled JSON-RPC method name.
+        :param params: JSON-serializable RPC method parameters.
+        :param operation: Safe operation identifier for errors.
+        :return: Validated JSON-RPC result field.
+        :raises ProviderError: If transport, JSON or RPC validation fails.
+        """
+        request_id = 0
+
+        async def send() -> httpx.Response:
+            """Perform one authenticated JSON-RPC HTTP attempt."""
+            nonlocal request_id
+            request_id = next(self._request_ids)
+            return await self._client.post(
+                self._url,
+                json={"jsonrpc": "2.0", "id": request_id, "method": method, "params": params},
+                timeout=self._timeout,
+            )
+
+        def decode(response: httpx.Response) -> object:
+            """Validate the RPC envelope and return its result."""
+            try:
+                payload: object = response.json()
+            except (json.JSONDecodeError, ValueError):
+                raise ProviderMalformedResponseError("alchemy", operation) from None
+            data = _mapping(payload, operation=operation)
+            if data.get("jsonrpc") != "2.0" or type(data.get("id")) is not int:
+                raise ProviderMalformedResponseError("alchemy", operation)
+            if data["id"] != request_id:
+                raise ProviderMalformedResponseError("alchemy", operation)
+            if "error" in data:
+                rpc_error = _mapping(data["error"], operation=operation)
+                if rpc_error.get("code") == -32005:
+                    raise ProviderRateLimitError("alchemy", operation)
+                raise ProviderError("alchemy", operation)
+            if "result" not in data:
+                raise ProviderMalformedResponseError("alchemy", operation)
+            return data["result"]
+
+        return await self._execute_http(operation=operation, send=send, decode=decode)
+
+    async def request_alchemy_prices(self, *, contract_address: str | None = None) -> object:
+        """Read one Mainnet USD price via the Alchemy Prices REST API.
+
+        Native ETH uses a fixed ETH symbol, never token metadata. ERC-20 prices
+        are looked up by network and contract address, not by ticker.
+
+        :param contract_address: Canonical token address, or None for native ETH.
+        :return: Validated top-level Prices API object (infrastructure only).
+        :raises ProviderError: For transport or response failures.
+        :raises ValueError: If contract address is invalid.
+        """
+        address = None if contract_address is None else _address(contract_address)
+        operation = "get_current_price"
+
+        async def send() -> httpx.Response:
+            """Use the same owned session, timeout and semaphore as RPC."""
+            if address is None:
+                return await self._client.get(
+                    f"{self._prices_url}/by-symbol",
+                    params={"symbols": "ETH"},
+                    timeout=self._timeout,
+                )
+            return await self._client.post(
+                f"{self._prices_url}/by-address",
+                json={"addresses": [{"network": "eth-mainnet", "address": address}]},
+                timeout=self._timeout,
+            )
+
+        def decode(response: httpx.Response) -> object:
+            """Validate the REST envelope before asset-specific price parsing."""
+            try:
+                payload: object = response.json()
+            except (json.JSONDecodeError, ValueError):
+                raise ProviderMalformedResponseError("alchemy", operation) from None
+            data = _mapping(payload, operation=operation)
+            if not isinstance(data.get("data"), list):
+                raise ProviderMalformedResponseError("alchemy", operation)
+            return data
+
+        return await self._execute_http(operation=operation, send=send, decode=decode)
 
     async def request_alchemy_method(
         self, method: str, params: list[object], *, operation: str

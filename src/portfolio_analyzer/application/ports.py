@@ -106,22 +106,26 @@ class TokenMetadataProvider(Protocol):
         ...
 
 
-class PriceProvider(Protocol):
-    """Provide timestamped USD prices without assuming a particular vendor."""
+class CurrentPriceProvider(Protocol):
+    """Provide current price observations without requiring historical lookup."""
 
     async def get_current_price(self, asset_id: AssetId) -> PriceQuote | None:
-        """Get a current trusted USD price observation.
+        """Get a timestamped USD quote for one asset.
 
         :param asset_id: Canonical asset identity.
-        :return: Price observation, or None when unavailable.
+        :return: Known quote, or None if current price is unavailable.
         """
         ...
+
+
+class PriceProvider(CurrentPriceProvider, Protocol):
+    """Extend current-price access with historical price lookup when implemented."""
 
     async def get_historical_price(self, asset_id: AssetId, at: datetime) -> PriceQuote | None:
         """Get a USD price observation relevant to a transaction timestamp.
 
         :param asset_id: Canonical asset identity.
         :param at: Timezone-aware UTC-compatible transaction timestamp.
-        :return: Price observation with its actual observed_at, or None if unknown.
+        :return: Historical observation, or None when unknown.
         """
         ...
