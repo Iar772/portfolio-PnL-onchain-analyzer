@@ -7,7 +7,6 @@ import math
 import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from http import HTTPStatus
 from typing import Any
 
 import httpx
@@ -147,19 +146,17 @@ def _receipt_success(raw: dict[str, Any]) -> bool | None:
     """Classify receipt status while preserving pre-Byzantium uncertainty.
 
     :param raw: JSON-RPC receipt data validated as an object.
-    :return: True for success, False for revert, or None for legacy receipts.
-    :raises ProviderMalformedResponseError: If status data is invalid.
+    :return: True for 0x1, False for 0x0, None for legacy root-only receipts.
+    :raises ProviderMalformedResponseError: For missing or invalid status data.
     """
     operation = "get_transaction_receipt"
 
     if "status" in raw:
         status = raw["status"]
-
         if status == "0x1":
             return True
         if status == "0x0":
             return False
-
         raise ProviderMalformedResponseError("alchemy", operation)
 
     if "root" in raw:
@@ -263,17 +260,13 @@ class AlchemyRpcProvider:
                         },
                         timeout=self._timeout,
                     )
-                if response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
+                if response.status_code == 429:
                     raise ProviderRateLimitError("alchemy", operation)
-                if response.status_code in (HTTPStatus.REQUEST_TIMEOUT, HTTPStatus.GATEWAY_TIMEOUT):
+                if response.status_code in (408, 504):
                     raise ProviderTimeoutError("alchemy", operation)
-                if response.status_code in (
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                    HTTPStatus.BAD_GATEWAY,
-                    HTTPStatus.SERVICE_UNAVAILABLE,
-                ):
+                if response.status_code in (500, 502, 503):
                     raise ProviderUnavailableError("alchemy", operation)
-                if response.status_code >= HTTPStatus.BAD_REQUEST:
+                if response.status_code >= 400:
                     raise ProviderError("alchemy", operation)
                 try:
                     payload: object = response.json()
@@ -305,6 +298,21 @@ class AlchemyRpcProvider:
             delay = min(self._max_backoff, self._base_backoff * 2 ** (attempt - 1))
             await self._sleep(delay)
         raise AssertionError("Unreachable: bounded RPC retry loop exhausted")
+
+    async def request_alchemy_method(
+        self, method: str, params: list[object], *, operation: str
+    ) -> object:
+        """Share bounded HTTP transport with sibling Alchemy adapters.
+
+        This is infrastructure-only; it is not part of the RpcProvider port.
+
+        :param method: Vendor JSON-RPC method name.
+        :param params: JSON-RPC parameters.
+        :param operation: Safe internal operation name for errors.
+        :return: Decoded JSON-RPC result payload.
+        :raises ProviderError: When request, retry, or response validation fails.
+        """
+        return await self._request(method, params, operation=operation)
 
     async def get_chain_id(self) -> int:
         """Return provider chain ID; the composition root must require Mainnet.
