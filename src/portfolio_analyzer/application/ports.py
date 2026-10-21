@@ -6,10 +6,11 @@ from typing import Protocol
 from portfolio_analyzer.application.provider_models import PriceQuote
 from portfolio_analyzer.domain.assets import AssetAmount, AssetId, AssetMetadata
 from portfolio_analyzer.ethereum.models import EthereumTransaction
+from portfolio_analyzer.ethereum.rpc_models import RpcBlock, RpcReceipt, RpcTransaction
 
 
 class RpcProvider(Protocol):
-    """Expose chain status without leaking JSON-RPC transport details."""
+    """Expose Ethereum read-only RPC facts without vendor transport details."""
 
     async def get_chain_id(self) -> int:
         """Return the chain identifier of the connected network.
@@ -22,6 +23,49 @@ class RpcProvider(Protocol):
         """Return the most recently observed block number.
 
         :return: Nonnegative latest block number.
+        """
+        ...
+
+    async def get_balance(self, address: str, *, at_block: int | None = None) -> AssetAmount:
+        """Retrieve native ETH balance exactly, without float conversion.
+
+        :param address: Ethereum wallet address.
+        :param at_block: Optional historical block; None means latest.
+        :return: Native ETH balance in whole-ETH units.
+        """
+        ...
+
+    async def get_transaction_by_hash(self, tx_hash: str) -> RpcTransaction | None:
+        """Retrieve a transaction, including pending transactions.
+
+        :param tx_hash: Ethereum transaction hash.
+        :return: Transaction facts or None when not found.
+        """
+        ...
+
+    async def get_transaction_receipt(self, tx_hash: str) -> RpcReceipt | None:
+        """Retrieve an execution receipt, absent while transaction is pending.
+
+        :param tx_hash: Ethereum transaction hash.
+        :return: Execution receipt or None when not yet available.
+        """
+        ...
+
+    async def get_block(self, block_number: int) -> RpcBlock | None:
+        """Retrieve block timestamp facts by a nonnegative block number.
+
+        :param block_number: Ethereum block height.
+        :return: Block facts or None if missing.
+        """
+        ...
+
+    async def eth_call(self, to_address: str, data: bytes, *, at_block: int | None = None) -> bytes:
+        """Execute a read-only contract call without decoding ABI data.
+
+        :param to_address: Contract address.
+        :param data: ABI-encoded call data.
+        :param at_block: Optional historical block, default latest.
+        :return: Raw return bytes for the caller to decode.
         """
         ...
 
