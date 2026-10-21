@@ -36,16 +36,16 @@ class JsonEventFormatter(logging.Formatter):
             "event": event_name,
         }
 
-        for field_name in ("provider", "operation"):
+        for field_name in ("provider", "operation", "failure_kind", "direction"):
             field_value = getattr(record, field_name, None)
             if isinstance(field_value, str) and _EVENT_NAME_RE.fullmatch(field_value):
                 payload[field_name] = field_value
 
-        for field_name in ("duration_ms", "attempt"):
+        for field_name in ("duration_ms", "attempt", "page_count", "movement_count"):
             field_value = getattr(record, field_name, None)
-
-            if type(field_value) is int and field_value >= 0:
-                payload[field_name] = field_value
+            if type(field_value) is not int or field_value < 0:
+                continue
+            payload[field_name] = field_value
 
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 

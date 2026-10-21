@@ -1,5 +1,6 @@
 """Alchemy Transfers API adapter with strict complete-history guarantees."""
 
+import logging
 import re
 from datetime import datetime
 from typing import Any
@@ -23,6 +24,7 @@ from portfolio_analyzer.infrastructure.alchemy.rpc import (
 _OPERATION = "get_history"
 _CATEGORIES = ["external", "internal", "erc20"]
 _RAW_VALUE_RE = re.compile(r"0x[0-9a-fA-F]+\Z")
+_LOGGER = logging.getLogger(__name__)
 
 
 def _raw_units(value: object) -> int:
@@ -98,30 +100,28 @@ def _parse_transfer(raw: object) -> AssetMovement:
 
 
 def _merge_directions(
-    outgoing: list[AssetMovement],
-    incoming: list[AssetMovement],
+    outgoing: list[AssetMovement], incoming: list[AssetMovement]
 ) -> list[AssetMovement]:
     """Merge both directions without losing or double-counting movements.
 
-    :param outgoing: Complete outgoing movements.
-    :param incoming: Complete incoming movements.
-    :return: Unique movements in ascending block order.
+    Distinct movements must be preserved. A transfer addressed to the same
+    wallet may appear twice with the same provenance ID. Incompatible facts
+    under that ID are an error, not a reason to arbitrarily choose one.
+
+    :param outgoing: Complete movements where the wallet is sender.
+    :param incoming: Complete movements where the wallet is recipient.
+    :return: Unique movements in stable ascending block order.
     :raises ProviderPartialResultError: If duplicate identities disagree.
     """
     movements_by_id: dict[str, AssetMovement] = {}
 
     for movement in (*outgoing, *incoming):
         previous = movements_by_id.get(movement.transfer_id)
-
         if previous is not None and previous != movement:
             raise ProviderPartialResultError("alchemy", _OPERATION)
-
         movements_by_id[movement.transfer_id] = movement
 
-    return sorted(
-        movements_by_id.values(),
-        key=lambda movement: movement.block_number,
-    )
+    return sorted(movements_by_id.values(), key=lambda movement: movement.block_number)
 
 
 class AlchemyHistoryProvider:
@@ -209,17 +209,47 @@ class AlchemyHistoryProvider:
                     raise ProviderPartialResultError("alchemy", _OPERATION)
                 results.extend(parsed)
                 if not cursor:
+                    _LOGGER.info(
+                        "history_direction_completed",
+                        extra={
+                            "provider": "alchemy",
+                            "operation": _OPERATION,
+                            "direction": direction,
+                            "page_count": page_num + 1,
+                            "movement_count": len(results),
+                        },
+                    )
                     return results
                 if cursor in seen_cursors or page_num + 1 >= self._max_pages_per_direction:
                     raise ProviderPartialResultError("alchemy", _OPERATION)
                 seen_cursors.add(cursor)
                 params["pageKey"] = cursor
             except ProviderError as exc:
+                _LOGGER.warning(
+                    "history_incomplete",
+                    extra={
+                        "provider": "alchemy",
+                        "operation": _OPERATION,
+                        "direction": direction,
+                        "page_count": page_num + 1,
+                        "movement_count": len(results),
+                    },
+                )
                 if isinstance(exc, ProviderPartialResultError):
                     raise
                 if page_num == 0 and not prior_completed:
                     raise
                 raise ProviderPartialResultError("alchemy", _OPERATION) from None
+        _LOGGER.warning(
+            "history_incomplete",
+            extra={
+                "provider": "alchemy",
+                "operation": _OPERATION,
+                "direction": direction,
+                "page_count": self._max_pages_per_direction,
+                "movement_count": len(results),
+            },
+        )
         raise ProviderPartialResultError("alchemy", _OPERATION)
 
     async def get_history(self, address: str) -> list[AssetMovement]:
@@ -240,4 +270,20 @@ class AlchemyHistoryProvider:
         incoming = await self._get_direction(
             wallet, direction="incoming", through_block=snapshot, prior_completed=True
         )
-        return _merge_directions(out, incoming)
+        try:
+            movements = _merge_directions(out, incoming)
+        except ProviderPartialResultError:
+            _LOGGER.warning(
+                "history_incomplete",
+                extra={"provider": "alchemy", "operation": _OPERATION},
+            )
+            raise
+        _LOGGER.info(
+            "history_completed",
+            extra={
+                "provider": "alchemy",
+                "operation": _OPERATION,
+                "movement_count": len(movements),
+            },
+        )
+        return movements
