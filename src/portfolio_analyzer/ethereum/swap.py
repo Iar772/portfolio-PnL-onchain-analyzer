@@ -8,6 +8,7 @@ from portfolio_analyzer.ethereum.direct_transfer_rules import (
     _NATIVE_METADATA,
     _assert_same_transaction,
 )
+from portfolio_analyzer.ethereum.known_contracts import MAINNET_WETH9 as _WETH9
 from portfolio_analyzer.ethereum.movements import MovementCategory
 from portfolio_analyzer.ethereum.normalizer import (
     EthereumNormalizationError,
@@ -20,7 +21,6 @@ from portfolio_analyzer.ethereum.wallet_deltas import (
 )
 
 # Contract identity, NOT ticker text: the canonical WETH9 contract on mainnet.
-_WETH9 = AssetId(chain_id=1, contract_address="0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2")
 _NATIVE_ETH = AssetId(chain_id=1, contract_address=None)
 _ZERO_ADDRESS = "0x" + "00" * 20
 _DIRECT_ERC20_TRANSFER = bytes.fromhex("a9059cbb")
