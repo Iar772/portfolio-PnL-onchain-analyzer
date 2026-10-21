@@ -3,8 +3,10 @@
 import asyncio
 import itertools
 import json
+import logging
 import math
 import re
+import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
@@ -28,6 +30,24 @@ _QUANTITY_RE = re.compile(r"0x(?:0|[1-9a-fA-F][0-9a-fA-F]*)\Z")
 _DATA_RE = re.compile(r"0x(?:[0-9a-fA-F]{2})*\Z")
 _ETH = AssetId(chain_id=1, contract_address=None)
 _ETH_METADATA = AssetMetadata(symbol="ETH", name="Ether", decimals=18)
+_LOGGER = logging.getLogger(__name__)
+
+
+def _failure_kind(error: ProviderError) -> str:
+    """Classify a provider error without exposing vendor text or HTTP payloads.
+
+    :param error: Normalized provider exception.
+    :return: Static, privacy-safe error category for structured logging.
+    """
+    if isinstance(error, ProviderRateLimitError):
+        return "rate_limit"
+    if isinstance(error, ProviderTimeoutError):
+        return "timeout"
+    if isinstance(error, ProviderUnavailableError):
+        return "unavailable"
+    if isinstance(error, ProviderMalformedResponseError):
+        return "malformed_response"
+    return "provider_error"
 
 
 def _address(value: object) -> str:
@@ -248,6 +268,9 @@ class AlchemyRpcProvider:
         """
         for attempt in range(1, self._max_attempts + 1):
             request_id = next(self._request_ids)
+            started = time.perf_counter()
+            context = {"provider": "alchemy", "operation": operation, "attempt": attempt}
+            _LOGGER.debug("provider_request_started", extra=context)
             try:
                 async with self._semaphore:
                     response = await self._client.post(
@@ -284,6 +307,13 @@ class AlchemyRpcProvider:
                     raise ProviderError("alchemy", operation)
                 if "result" not in data:
                     raise ProviderMalformedResponseError("alchemy", operation)
+                _LOGGER.debug(
+                    "provider_request_completed",
+                    extra={
+                        **context,
+                        "duration_ms": max(0, int((time.perf_counter() - started) * 1000)),
+                    },
+                )
                 return data["result"]
             except httpx.TimeoutException:
                 failure: ProviderError = ProviderTimeoutError("alchemy", operation)
@@ -291,10 +321,17 @@ class AlchemyRpcProvider:
                 failure = ProviderUnavailableError("alchemy", operation)
             except ProviderError as exc:
                 failure = exc
+            failure_context = {
+                **context,
+                "failure_kind": _failure_kind(failure),
+                "duration_ms": max(0, int((time.perf_counter() - started) * 1000)),
+            }
             if not should_retry_provider_error(
                 failure, attempts_made=attempt, max_attempts=self._max_attempts
             ):
+                _LOGGER.error("provider_request_failed", extra=failure_context)
                 raise failure from None
+            _LOGGER.warning("provider_request_retry", extra=failure_context)
             delay = min(self._max_backoff, self._base_backoff * 2 ** (attempt - 1))
             await self._sleep(delay)
         raise AssertionError("Unreachable: bounded RPC retry loop exhausted")

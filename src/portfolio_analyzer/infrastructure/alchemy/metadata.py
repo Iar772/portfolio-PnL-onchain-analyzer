@@ -1,15 +1,26 @@
 """Alchemy ERC-20 metadata adapter, independent of asset identity."""
 
+import logging
+
 from portfolio_analyzer.application.provider_errors import ProviderMalformedResponseError
 from portfolio_analyzer.domain.assets import AssetId, AssetMetadata
 from portfolio_analyzer.infrastructure.alchemy.rpc import AlchemyRpcProvider, _mapping
 
 _OPERATION = "get_token_metadata"
 _NATIVE_ETH_METADATA = AssetMetadata(symbol="ETH", name="Ether", decimals=18)
+_LOGGER = logging.getLogger(__name__)
 
 
 def _parse_token_metadata(raw: object) -> AssetMetadata | None:
-    """Convert Alchemy token fields to domain metadata without guessing missing data."""
+    """Convert Alchemy token fields to domain metadata without guessing missing data.
+
+    Missing or blank required fields mean metadata is unavailable, not zero.
+    Structurally invalid non-null fields are explicit provider errors.
+
+    :param raw: JSON-RPC result for alchemy_getTokenMetadata.
+    :return: Valid token metadata, or None if required fields are unavailable.
+    :raises ProviderMalformedResponseError: If present fields have invalid types or ranges.
+    """
     if raw is None:
         return None
 
@@ -28,7 +39,6 @@ def _parse_token_metadata(raw: object) -> AssetMetadata | None:
 
     normalized_name = name.strip()
     normalized_symbol = symbol.strip()
-
     if not normalized_name or not normalized_symbol:
         return None
 
@@ -82,4 +92,22 @@ class AlchemyTokenMetadataProvider:
             [asset_id.contract_address],
             operation=_OPERATION,
         )
-        return _parse_token_metadata(raw)
+        try:
+            metadata = _parse_token_metadata(raw)
+        except ProviderMalformedResponseError:
+            _LOGGER.warning(
+                "token_metadata_invalid",
+                extra={"provider": "alchemy", "operation": _OPERATION},
+            )
+            raise
+        if metadata is None:
+            _LOGGER.info(
+                "token_metadata_unavailable",
+                extra={"provider": "alchemy", "operation": _OPERATION},
+            )
+        else:
+            _LOGGER.debug(
+                "token_metadata_completed",
+                extra={"provider": "alchemy", "operation": _OPERATION},
+            )
+        return metadata
