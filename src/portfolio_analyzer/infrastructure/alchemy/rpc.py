@@ -264,12 +264,14 @@ class AlchemyRpcProvider:
         operation: str,
         send: Callable[[], Awaitable[httpx.Response]],
         decode: Callable[[httpx.Response], object],
+        not_found_returns_none: bool = False,
     ) -> object:
         """Apply one bounded request/retry policy to RPC and Prices APIs.
 
         :param operation: Safe internal operation name.
         :param send: One HTTP attempt, borrowing the shared client.
         :param decode: Validate a successful response without exposing payloads.
+        :param not_found_returns_none: Treat an HTTP 404 as missing only for opted-in lookups.
         :return: Validated vendor result for the infrastructure caller.
         :raises ProviderError: For exhausted attempts or invalid responses.
         """
@@ -280,6 +282,15 @@ class AlchemyRpcProvider:
             try:
                 async with self._semaphore:
                     response = await asyncio.wait_for(send(), timeout=self._timeout)
+                if response.status_code == 404 and not_found_returns_none:
+                    _LOGGER.debug(
+                        "provider_request_completed",
+                        extra={
+                            **context,
+                            "duration_ms": max(0, int((time.perf_counter() - started) * 1000)),
+                        },
+                    )
+                    return None
                 if response.status_code == 429:
                     raise ProviderRateLimitError("alchemy", operation)
                 if response.status_code in (408, 504):
@@ -401,6 +412,70 @@ class AlchemyRpcProvider:
             return data
 
         return await self._execute_http(operation=operation, send=send, decode=decode)
+
+    async def request_alchemy_historical_prices(
+        self,
+        *,
+        contract_address: str | None,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> object | None:
+        """Fetch timestamped USD price points using the shared Prices REST transport.
+
+        Native ETH uses the fixed ETH symbol; ERC-20 uses Mainnet+address.
+        HTTP 404 means unsupported historical prices only for this endpoint.
+
+        :param contract_address: Token contract or None for native ETH.
+        :param start_time: Inclusive timezone-aware start of lookup window.
+        :param end_time: Inclusive timezone-aware end of lookup window.
+        :return: Top-level REST payload or None on HTTP 404.
+        :raises TypeError: If timestamps have incorrect types.
+        :raises ValueError: If window or contract address is invalid.
+        :raises ProviderError: For transport or malformed JSON failures.
+        """
+        address = None if contract_address is None else _address(contract_address)
+        if not isinstance(start_time, datetime) or not isinstance(end_time, datetime):
+            raise TypeError("historical price timestamps must be datetimes")
+        if start_time.utcoffset() is None or end_time.utcoffset() is None:
+            raise ValueError("historical price timestamps must be timezone-aware")
+        start_utc = start_time.astimezone(UTC)
+        end_utc = end_time.astimezone(UTC)
+        if start_utc >= end_utc:
+            raise ValueError("historical price window must be increasing")
+        operation = "get_historical_price"
+        payload: dict[str, object] = {
+            "startTime": start_utc.isoformat().replace("+00:00", "Z"),
+            "endTime": end_utc.isoformat().replace("+00:00", "Z"),
+            "interval": "5m",
+        }
+        if address is None:
+            payload["symbol"] = "ETH"
+        else:
+            payload["network"] = "eth-mainnet"
+            payload["address"] = address
+
+        async def send() -> httpx.Response:
+            """Issue one bounded historical-pricing request."""
+            return await self._client.post(
+                f"{self._prices_url}/historical",
+                json=payload,
+                timeout=self._timeout,
+            )
+
+        def decode(response: httpx.Response) -> object:
+            """Reject malformed REST JSON before price-specific validation."""
+            try:
+                data: object = response.json()
+            except (json.JSONDecodeError, ValueError):
+                raise ProviderMalformedResponseError("alchemy", operation) from None
+            return _mapping(data, operation=operation)
+
+        return await self._execute_http(
+            operation=operation,
+            send=send,
+            decode=decode,
+            not_found_returns_none=True,
+        )
 
     async def request_alchemy_method(
         self, method: str, params: list[object], *, operation: str
