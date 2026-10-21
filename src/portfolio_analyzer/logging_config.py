@@ -41,7 +41,14 @@ class JsonEventFormatter(logging.Formatter):
             if isinstance(field_value, str) and _EVENT_NAME_RE.fullmatch(field_value):
                 payload[field_name] = field_value
 
-        for field_name in ("duration_ms", "attempt", "page_count", "movement_count"):
+        for field_name in (
+            "duration_ms",
+            "attempt",
+            "page_count",
+            "movement_count",
+            "token_count",
+            "unresolved_count",
+        ):
             field_value = getattr(record, field_name, None)
             if type(field_value) is not int or field_value < 0:
                 continue
