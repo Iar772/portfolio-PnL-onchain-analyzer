@@ -27,6 +27,7 @@ class SwapValuationStatus(StrEnum):
     NO_VOLATILE_PAIR = "no_volatile_pair"
     VOLATILE_PRICE_UNRELIABLE = "volatile_price_unreliable"
     VOLATILE_PRICE_DISAGREEMENT = "volatile_price_disagreement"
+    PRICE_DIVERGENCE_UNCALIBRATED = "price_divergence_uncalibrated"
     PRICE_UNAVAILABLE = "price_unavailable"
     PRICE_OUTSIDE_WINDOW = "price_outside_window"
 

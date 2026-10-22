@@ -1,15 +1,20 @@
 """Conservative historical USD valuation for two volatile ERC-20 swap legs.
 
-Both observed USD values must be timely, positive, and sufficiently similar.
+Both observed USD values must be timely and positive. Acceptance requires an
+explicit evidence-backed divergence threshold; there is no default threshold.
 The outgoing leg sets the single accounting value only after cross-checking
 against the incoming leg; disagreements are explicit unknown valuations.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from decimal import Context, Decimal, localcontext
 
 from portfolio_analyzer.application.ports import PriceProvider
+from portfolio_analyzer.application.price_divergence import (
+    DivergenceDecision,
+    PriceDivergencePolicy,
+)
 from portfolio_analyzer.application.provider_models import PriceQuote
 from portfolio_analyzer.application.trade_valuation import (
     SwapUsdValuation,
@@ -24,8 +29,6 @@ from portfolio_analyzer.domain.money import UsdAmount
 from portfolio_analyzer.domain.stablecoins import StablecoinRegistry
 from portfolio_analyzer.ethereum.known_contracts import MAINNET_WETH9
 
-DEFAULT_MAX_SPREAD = Decimal("0.05")
-
 
 @dataclass(frozen=True, slots=True)
 class VolatilePriceComparison:
@@ -37,6 +40,7 @@ class VolatilePriceComparison:
     :param outgoing_value_usd: Observed USD value of the outgoing token, if valid.
     :param incoming_value_usd: Observed USD value of the incoming token, if valid.
     :param relative_spread: Relative USD disagreement, if both values are positive.
+    :param divergence_policy: The exact calibration gate used to decide the outcome.
     :raises TypeError: If quotation or value evidence has incorrect types.
     :raises ValueError: If evidence is internally inconsistent.
     """
@@ -47,6 +51,7 @@ class VolatilePriceComparison:
     outgoing_value_usd: UsdAmount | None
     incoming_value_usd: UsdAmount | None
     relative_spread: Decimal | None
+    divergence_policy: PriceDivergencePolicy = field(default_factory=PriceDivergencePolicy)
 
     def __post_init__(self) -> None:
         """Ensure a transparent comparison cannot contradict its valuation.
@@ -54,6 +59,8 @@ class VolatilePriceComparison:
         :raises TypeError: For incorrect evidence types.
         :raises ValueError: For contradictory quote/value pairs or status.
         """
+        if not isinstance(self.divergence_policy, PriceDivergencePolicy):
+            raise TypeError("divergence_policy must be PriceDivergencePolicy")
         if not isinstance(self.valuation, SwapUsdValuation):
             raise TypeError("valuation must be SwapUsdValuation")
         for quote in (self.outgoing_quote, self.incoming_quote):
@@ -108,6 +115,24 @@ class VolatilePriceComparison:
                 raise ValueError("accepted USD value must equal outgoing market value")
             if self.incoming_value_usd is None or self.relative_spread is None:
                 raise ValueError("accepted swap must have a complete comparison")
+            if (
+                self.divergence_policy.evaluate(self.relative_spread)
+                is not DivergenceDecision.ACCEPTED
+            ):
+                raise ValueError("accepted swap requires calibrated, matching divergence policy")
+        if self.valuation.status in (
+            SwapValuationStatus.PRICE_DIVERGENCE_UNCALIBRATED,
+            SwapValuationStatus.VOLATILE_PRICE_DISAGREEMENT,
+        ):
+            if self.relative_spread is None:
+                raise ValueError("divergence status requires a computed spread")
+            expected_decision = (
+                DivergenceDecision.UNCALIBRATED
+                if self.valuation.status is SwapValuationStatus.PRICE_DIVERGENCE_UNCALIBRATED
+                else DivergenceDecision.REJECTED
+            )
+            if self.divergence_policy.evaluate(self.relative_spread) is not expected_decision:
+                raise ValueError("divergence status contradicts its stored policy")
 
     @property
     def disposal_proceeds(self) -> UsdAmount | None:
@@ -124,19 +149,6 @@ class VolatilePriceComparison:
         :return: Accepted acquisition basis or None when unknown.
         """
         return self.valuation.acquired_basis
-
-
-def _validate_spread(max_relative_spread: Decimal) -> None:
-    """Reject float, NaN, and nonsensical comparison tolerances.
-
-    :param max_relative_spread: Maximum accepted fractional disagreement.
-    :raises TypeError: Unless the tolerance is Decimal.
-    :raises ValueError: Unless the tolerance is finite and between zero and one.
-    """
-    if not isinstance(max_relative_spread, Decimal):
-        raise TypeError("max_relative_spread must be Decimal")
-    if not max_relative_spread.is_finite() or not Decimal(0) <= max_relative_spread <= 1:
-        raise ValueError("max_relative_spread must be finite and between 0 and 1")
 
 
 def is_volatile_erc20_pair(swap: Swap, registry: StablecoinRegistry) -> bool:
@@ -206,12 +218,12 @@ def calculate_volatile_swap_valuation(
     incoming_quote: PriceQuote | None,
     *,
     max_distance: timedelta = timedelta(minutes=15),
-    max_relative_spread: Decimal = DEFAULT_MAX_SPREAD,
+    divergence_policy: PriceDivergencePolicy | None = None,
 ) -> VolatilePriceComparison:
     """Cross-check both volatile ERC-20 legs and accept one common USD value.
 
     Two individually priced sides are not automatically reliable: stale, zero,
-    or materially divergent market observations are returned as unknown.
+    divergent or as-yet uncalibrated observations are returned as unknown.
     For accepted trades the outgoing USD value provides BOTH proceeds and
     acquired basis, with independent incoming evidence retained for audit.
 
@@ -220,13 +232,15 @@ def calculate_volatile_swap_valuation(
     :param outgoing_quote: Observed USD price of disposed ERC-20 or None.
     :param incoming_quote: Observed USD price of acquired ERC-20 or None.
     :param max_distance: Allowed distance from transaction timestamp.
-    :param max_relative_spread: Maximum fraction of value disagreement.
+    :param divergence_policy: Evidence-backed tolerance, or None for unknown valuation.
     :return: Observations plus the existing common accounting valuation.
     :raises TypeError: For invalid input or quote types.
     :raises ValueError: For invalid comparison policy.
     """
     validate_quote_window(max_distance)
-    _validate_spread(max_relative_spread)
+    if divergence_policy is not None and not isinstance(divergence_policy, PriceDivergencePolicy):
+        raise TypeError("divergence_policy must be PriceDivergencePolicy or None")
+    policy = divergence_policy or PriceDivergencePolicy()
     eligible = is_volatile_erc20_pair(swap, registry)
     for quote in (outgoing_quote, incoming_quote):
         if quote is not None and not isinstance(quote, PriceQuote):
@@ -239,6 +253,7 @@ def calculate_volatile_swap_valuation(
             None,
             None,
             None,
+            policy,
         )
 
     outgoing_usd = (
@@ -264,10 +279,16 @@ def calculate_volatile_swap_valuation(
         status = SwapValuationStatus.PRICE_UNAVAILABLE
     elif outside_window or is_nonpositive:
         status = SwapValuationStatus.VOLATILE_PRICE_UNRELIABLE
-    elif spread is not None and spread > max_relative_spread:
-        status = SwapValuationStatus.VOLATILE_PRICE_DISAGREEMENT
+    elif spread is not None:
+        decision = policy.evaluate(spread)
+        if decision is DivergenceDecision.UNCALIBRATED:
+            status = SwapValuationStatus.PRICE_DIVERGENCE_UNCALIBRATED
+        elif decision is DivergenceDecision.REJECTED:
+            status = SwapValuationStatus.VOLATILE_PRICE_DISAGREEMENT
+        else:
+            status = SwapValuationStatus.VALUED
     else:
-        status = SwapValuationStatus.VALUED
+        status = SwapValuationStatus.VOLATILE_PRICE_UNRELIABLE
 
     valuation = (
         calculate_swap_valuation_for_side(
@@ -288,6 +309,7 @@ def calculate_volatile_swap_valuation(
         outgoing_usd,
         incoming_usd,
         spread,
+        policy,
     )
 
 
@@ -297,7 +319,7 @@ async def value_swap_by_volatile(
     provider: PriceProvider,
     *,
     max_distance: timedelta = timedelta(minutes=15),
-    max_relative_spread: Decimal = DEFAULT_MAX_SPREAD,
+    divergence_policy: PriceDivergencePolicy | None = None,
 ) -> VolatilePriceComparison:
     """Fetch both historical ERC-20 quotes at the transaction timestamp.
 
@@ -308,14 +330,16 @@ async def value_swap_by_volatile(
     :param registry: Trusted stablecoin contracts excluded from this policy.
     :param provider: Async vendor-neutral historical USD prices.
     :param max_distance: Allowed distance from the transaction timestamp.
-    :param max_relative_spread: Allowed relative USD disagreement.
+    :param divergence_policy: Evidence-backed tolerance, or None for unknown valuation.
     :return: Independent evidence plus a shared USD accounting valuation.
     :raises ProviderError: On provider failure (no silent unknown masking).
     :raises TypeError: On invalid input or returned quote types.
     :raises ValueError: For invalid valuation policy.
     """
     validate_quote_window(max_distance)
-    _validate_spread(max_relative_spread)
+    if divergence_policy is not None and not isinstance(divergence_policy, PriceDivergencePolicy):
+        raise TypeError("divergence_policy must be PriceDivergencePolicy or None")
+    policy = divergence_policy or PriceDivergencePolicy()
     if not is_volatile_erc20_pair(swap, registry):
         return calculate_volatile_swap_valuation(
             swap,
@@ -323,7 +347,7 @@ async def value_swap_by_volatile(
             None,
             None,
             max_distance=max_distance,
-            max_relative_spread=max_relative_spread,
+            divergence_policy=policy,
         )
     outgoing_quote = await provider.get_historical_price(
         swap.amount_out.asset_id,
@@ -343,5 +367,5 @@ async def value_swap_by_volatile(
         outgoing_quote,
         incoming_quote,
         max_distance=max_distance,
-        max_relative_spread=max_relative_spread,
+        divergence_policy=policy,
     )
