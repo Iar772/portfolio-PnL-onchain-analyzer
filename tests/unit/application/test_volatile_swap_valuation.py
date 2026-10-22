@@ -6,11 +6,11 @@ from decimal import Decimal, localcontext
 
 import pytest
 
+from portfolio_analyzer.application.price_divergence import PriceDivergencePolicy
 from portfolio_analyzer.application.provider_errors import ProviderRateLimitError
 from portfolio_analyzer.application.provider_models import PriceQuote
 from portfolio_analyzer.application.trade_valuation import SwapValuationStatus
 from portfolio_analyzer.application.volatile_valuation import (
-    DEFAULT_MAX_SPREAD,
     VolatilePriceComparison,
     calculate_volatile_swap_valuation,
     is_volatile_erc20_pair,
@@ -21,6 +21,15 @@ from portfolio_analyzer.domain.events import EventMetadata, Swap
 from portfolio_analyzer.domain.money import UsdAmount, UsdPrice
 from portfolio_analyzer.ethereum.known_contracts import MAINNET_WETH9
 from portfolio_analyzer.ethereum.stablecoins import MAINNET_USD_STABLECOINS, MAINNET_USDC
+
+
+def fixture_policy(value: Decimal) -> PriceDivergencePolicy:
+    """Use synthetic tolerance solely to test deterministic comparison branches."""
+    return PriceDivergencePolicy(value, "unit-fixture:synthetic-threshold")
+
+
+TEST_POLICY = fixture_policy(Decimal("0.05"))
+
 
 TX_TIME = datetime(2024, 9, 10, 12, 0, tzinfo=UTC)
 LINK = AssetId(1, "0x" + "aa" * 20)
@@ -98,7 +107,9 @@ def test_pair_eligibility_uses_verified_asset_identity(
 def test_both_priced_and_consistent_share_one_accounting_value() -> None:
     """Never independently calculate acquired basis from the incoming quote."""
     swap = make_swap()
-    result = calculate_volatile_swap_valuation(swap, REGISTRY, quote("2"), quote("1"))
+    result = calculate_volatile_swap_valuation(
+        swap, REGISTRY, quote("2"), quote("1"), divergence_policy=TEST_POLICY
+    )
     assert result.valuation.swap is swap
     assert result.valuation.status is SwapValuationStatus.VALUED
     assert result.valuation.anchor_side == "out"
@@ -131,10 +142,7 @@ def test_comparison_handles_agreement_divergence_and_zero(
 ) -> None:
     """Outlying or zero volatile quotes cannot create invented known basis."""
     result = calculate_volatile_swap_valuation(
-        make_swap(),
-        REGISTRY,
-        quote(out_price),
-        quote(in_price),
+        make_swap(), REGISTRY, quote(out_price), quote(in_price), divergence_policy=TEST_POLICY
     )
     assert result.valuation.status is status
     if status is SwapValuationStatus.VALUED:
@@ -151,7 +159,9 @@ def test_missing_any_historical_quote_keeps_both_cost_values_unknown(missing_sid
     """One good quote alone is insufficient evidence for volatile-pair valuation."""
     out_quote = None if missing_side in ("out", "both") else quote("2")
     in_quote = None if missing_side in ("in", "both") else quote("1")
-    result = calculate_volatile_swap_valuation(make_swap(), REGISTRY, out_quote, in_quote)
+    result = calculate_volatile_swap_valuation(
+        make_swap(), REGISTRY, out_quote, in_quote, divergence_policy=TEST_POLICY
+    )
     assert result.valuation.status is SwapValuationStatus.PRICE_UNAVAILABLE
     assert not result.valuation.is_known
     assert result.disposal_proceeds is None
@@ -166,6 +176,7 @@ def test_stale_either_quote_is_unreliable(drift_out: int, drift_in: int) -> None
         REGISTRY,
         quote("2", offset_minutes=drift_out),
         quote("1", offset_minutes=drift_in),
+        divergence_policy=TEST_POLICY,
     )
     assert result.valuation.status is SwapValuationStatus.VOLATILE_PRICE_UNRELIABLE
     assert result.valuation.value_usd is None
@@ -179,6 +190,7 @@ def test_both_quotes_within_inclusive_window_accepted(drift: int) -> None:
         REGISTRY,
         quote("2", offset_minutes=drift),
         quote("1", offset_minutes=drift),
+        divergence_policy=TEST_POLICY,
     )
     assert result.valuation.is_known
 
@@ -187,7 +199,9 @@ def test_misaligned_observation_times_are_transparently_kept() -> None:
     """Timestamp provenance for both independent price observations is retained."""
     first = quote("2", offset_minutes=-13)
     second = quote("1", offset_minutes=14)
-    result = calculate_volatile_swap_valuation(make_swap(), REGISTRY, first, second)
+    result = calculate_volatile_swap_valuation(
+        make_swap(), REGISTRY, first, second, divergence_policy=TEST_POLICY
+    )
     assert result.valuation.is_known
     assert result.outgoing_quote is first
     assert result.incoming_quote is second
@@ -195,20 +209,17 @@ def test_misaligned_observation_times_are_transparently_kept() -> None:
 
 def test_threshold_can_be_configured_without_replacing_price_quotes() -> None:
     """Allow deliberate risk-policy tuning while preserving identical USD legs."""
-    assert DEFAULT_MAX_SPREAD == Decimal("0.05")
+    assert PriceDivergencePolicy().max_relative_spread is None
     swap = make_swap()
     strict = calculate_volatile_swap_valuation(
-        swap,
-        REGISTRY,
-        quote("2"),
-        quote("1.06"),
+        swap, REGISTRY, quote("2"), quote("1.06"), divergence_policy=TEST_POLICY
     )
     permissive = calculate_volatile_swap_valuation(
         swap,
         REGISTRY,
         quote("2"),
         quote("1.06"),
-        max_relative_spread=Decimal("0.10"),
+        divergence_policy=fixture_policy(Decimal("0.10")),
     )
     assert strict.valuation.status is SwapValuationStatus.VOLATILE_PRICE_DISAGREEMENT
     assert permissive.valuation.status is SwapValuationStatus.VALUED
@@ -226,11 +237,11 @@ def test_invalid_tolerance_rejected(bad: Decimal) -> None:
             REGISTRY,
             quote("2"),
             quote("1"),
-            max_relative_spread=bad,
+            divergence_policy=fixture_policy(bad),
         )
 
 
-@pytest.mark.parametrize("bad", [0.05, "0.05", None])
+@pytest.mark.parametrize("bad", [0.05, "0.05"])
 def test_invalid_tolerance_type_rejected(bad: object) -> None:
     """Reject binary floats and unrelated input objects at runtime."""
     with pytest.raises(TypeError):
@@ -239,7 +250,7 @@ def test_invalid_tolerance_type_rejected(bad: object) -> None:
             REGISTRY,
             quote("2"),
             quote("1"),
-            max_relative_spread=bad,  # type: ignore[arg-type]
+            divergence_policy=fixture_policy(bad),  # type: ignore[arg-type]
         )
 
 
@@ -253,6 +264,7 @@ def test_invalid_window_rejected(bad: timedelta) -> None:
             quote("2"),
             quote("1"),
             max_distance=bad,
+            divergence_policy=TEST_POLICY,
         )
 
 
@@ -263,6 +275,7 @@ def test_unsupported_pairs_do_not_use_volatility_pricing() -> None:
         REGISTRY,
         quote("1"),
         quote("1"),
+        divergence_policy=TEST_POLICY,
     )
     assert result.valuation.status is SwapValuationStatus.NO_VOLATILE_PAIR
     assert result.valuation.anchor_asset_id is None
@@ -279,6 +292,7 @@ def test_invalid_quote_types_rejected(invalid: object) -> None:
             REGISTRY,
             invalid,
             quote("1"),  # type: ignore[arg-type]
+            divergence_policy=TEST_POLICY,
         )
 
 
@@ -293,6 +307,7 @@ def test_extremely_precise_micro_and_large_token_values_are_preserved() -> None:
         REGISTRY,
         quote("0.000000000000000000009"),
         quote("0.000000000000000000009"),
+        divergence_policy=TEST_POLICY,
     )
     with localcontext() as ctx:
         ctx.prec = 120
@@ -305,7 +320,9 @@ def test_extremely_precise_micro_and_large_token_values_are_preserved() -> None:
 async def test_fetches_two_distinct_assets_at_same_transaction_timestamp() -> None:
     """Only historical, identity-based prices may feed volatile valuation."""
     fake = FakePrices({LDO: quote("2"), LINK: quote("1")})
-    result = await value_swap_by_volatile(make_swap(), REGISTRY, fake)
+    result = await value_swap_by_volatile(
+        make_swap(), REGISTRY, fake, divergence_policy=TEST_POLICY
+    )
     assert result.valuation.is_known
     assert fake.calls == [(LDO, TX_TIME), (LINK, TX_TIME)]
 
@@ -314,7 +331,9 @@ async def test_fetches_two_distinct_assets_at_same_transaction_timestamp() -> No
 async def test_fetches_incoming_even_if_outgoing_missing() -> None:
     """Retain audit provenance without pretending that one quote is enough."""
     fake = FakePrices({LDO: None, LINK: quote("1")})
-    result = await value_swap_by_volatile(make_swap(), REGISTRY, fake)
+    result = await value_swap_by_volatile(
+        make_swap(), REGISTRY, fake, divergence_policy=TEST_POLICY
+    )
     assert not result.valuation.is_known
     assert result.valuation.status is SwapValuationStatus.PRICE_UNAVAILABLE
     assert fake.calls == [(LDO, TX_TIME), (LINK, TX_TIME)]
@@ -324,7 +343,9 @@ async def test_fetches_incoming_even_if_outgoing_missing() -> None:
 async def test_unsupported_pair_does_not_call_api() -> None:
     """Do not spend two costly historical calls on ETH- or stablecoin-backed swaps."""
     fake = FakePrices({MAINNET_USDC: quote("1"), LINK: quote("1")})
-    result = await value_swap_by_volatile(make_swap(MAINNET_USDC, LINK), REGISTRY, fake)
+    result = await value_swap_by_volatile(
+        make_swap(MAINNET_USDC, LINK), REGISTRY, fake, divergence_policy=TEST_POLICY
+    )
     assert result.valuation.status is SwapValuationStatus.NO_VOLATILE_PAIR
     assert fake.calls == []
 
@@ -341,7 +362,9 @@ async def test_provider_error_propagates_without_becoming_unknown() -> None:
             raise ProviderRateLimitError("alchemy", "historical_price")
 
     with pytest.raises(ProviderRateLimitError):
-        await value_swap_by_volatile(make_swap(), REGISTRY, BrokenPrices({}))
+        await value_swap_by_volatile(
+            make_swap(), REGISTRY, BrokenPrices({}), divergence_policy=TEST_POLICY
+        )
 
 
 @pytest.mark.asyncio
@@ -349,7 +372,7 @@ async def test_invalid_provider_return_does_not_become_unpriced() -> None:
     """Malformed price provider models must fail before pricing proceeds."""
     fake = FakePrices({LDO: "invalid", LINK: quote("1")})  # type: ignore[dict-item]
     with pytest.raises(TypeError):
-        await value_swap_by_volatile(make_swap(), REGISTRY, fake)
+        await value_swap_by_volatile(make_swap(), REGISTRY, fake, divergence_policy=TEST_POLICY)
     assert fake.calls == [(LDO, TX_TIME)]
 
 
@@ -362,14 +385,16 @@ async def test_invalid_policy_does_not_issue_any_external_request() -> None:
             make_swap(),
             REGISTRY,
             fake,
-            max_relative_spread=Decimal("NaN"),
+            divergence_policy=fixture_policy(Decimal("NaN")),
         )
     assert fake.calls == []
 
 
 def test_result_is_immutable_and_not_a_second_accounting_amount() -> None:
     """Comparison wraps existing accounting result and has no competing proceeds."""
-    result = calculate_volatile_swap_valuation(make_swap(), REGISTRY, quote("2"), quote("1"))
+    result = calculate_volatile_swap_valuation(
+        make_swap(), REGISTRY, quote("2"), quote("1"), divergence_policy=TEST_POLICY
+    )
     with pytest.raises(FrozenInstanceError):
         result.relative_spread = Decimal("0.5")  # type: ignore[misc]
     assert result.disposal_proceeds is result.valuation.value_usd
@@ -378,7 +403,9 @@ def test_result_is_immutable_and_not_a_second_accounting_amount() -> None:
 @pytest.mark.parametrize("bad", ["100", Decimal("NaN"), Decimal("-1")])
 def test_result_rejects_bogus_spread_evidence(bad: object) -> None:
     """A public result object cannot carry malformed relative disagreement."""
-    accepted = calculate_volatile_swap_valuation(make_swap(), REGISTRY, quote("2"), quote("1"))
+    accepted = calculate_volatile_swap_valuation(
+        make_swap(), REGISTRY, quote("2"), quote("1"), divergence_policy=TEST_POLICY
+    )
     error = TypeError if isinstance(bad, str) else ValueError
     with pytest.raises(error):
         VolatilePriceComparison(
@@ -388,12 +415,15 @@ def test_result_rejects_bogus_spread_evidence(bad: object) -> None:
             accepted.outgoing_value_usd,
             accepted.incoming_value_usd,
             bad,  # type: ignore[arg-type]
+            accepted.divergence_policy,
         )
 
 
 def test_comparison_rejects_forged_incoming_value_and_spread() -> None:
     """Independent market evidence cannot be forged after acceptance."""
-    base = calculate_volatile_swap_valuation(make_swap(), REGISTRY, quote("2"), quote("1"))
+    base = calculate_volatile_swap_valuation(
+        make_swap(), REGISTRY, quote("2"), quote("1"), divergence_policy=TEST_POLICY
+    )
     with pytest.raises(ValueError, match="incoming value must match"):
         VolatilePriceComparison(
             base.valuation,
@@ -402,6 +432,7 @@ def test_comparison_rejects_forged_incoming_value_and_spread() -> None:
             base.outgoing_value_usd,
             UsdAmount(Decimal("99")),
             Decimal("0.01"),
+            base.divergence_policy,
         )
     with pytest.raises(ValueError, match="spread must match"):
         VolatilePriceComparison(
@@ -411,12 +442,15 @@ def test_comparison_rejects_forged_incoming_value_and_spread() -> None:
             base.outgoing_value_usd,
             base.incoming_value_usd,
             Decimal("0.01"),
+            base.divergence_policy,
         )
 
 
 def test_comparison_rejects_wrong_accounting_anchor_quote() -> None:
     """Never swap a different market quote into already-approved accounting."""
-    base = calculate_volatile_swap_valuation(make_swap(), REGISTRY, quote("2"), quote("1"))
+    base = calculate_volatile_swap_valuation(
+        make_swap(), REGISTRY, quote("2"), quote("1"), divergence_policy=TEST_POLICY
+    )
     with pytest.raises(ValueError, match="accounting quote must"):
         VolatilePriceComparison(
             base.valuation,
@@ -425,16 +459,14 @@ def test_comparison_rejects_wrong_accounting_anchor_quote() -> None:
             base.outgoing_value_usd,
             base.incoming_value_usd,
             base.relative_spread,
+            base.divergence_policy,
         )
 
 
 def test_comparison_rejects_unsupported_pair_with_quote_evidence() -> None:
     """Do not silently imply an ineligible token was evaluated as volatile."""
     base = calculate_volatile_swap_valuation(
-        make_swap(MAINNET_USDC, LINK),
-        REGISTRY,
-        None,
-        None,
+        make_swap(MAINNET_USDC, LINK), REGISTRY, None, None, divergence_policy=TEST_POLICY
     )
     with pytest.raises(ValueError, match="unsupported volatile pairs"):
         VolatilePriceComparison(base.valuation, quote("1"), None, None, None, None)
@@ -459,7 +491,9 @@ def test_result_rejects_wrong_field_types(
     """Reject forged mutable or incorrectly typed diagnostic evidence."""
     from dataclasses import replace
 
-    base = calculate_volatile_swap_valuation(make_swap(), REGISTRY, quote("2"), quote("1"))
+    base = calculate_volatile_swap_valuation(
+        make_swap(), REGISTRY, quote("2"), quote("1"), divergence_policy=TEST_POLICY
+    )
     with pytest.raises(error, match=fragment):
         replace(base, **{field: replacement})
 
@@ -469,7 +503,9 @@ def test_result_rejects_value_without_quote(field: str) -> None:
     """USD evidence must always be traceable to a real price observation."""
     from dataclasses import replace
 
-    base = calculate_volatile_swap_valuation(make_swap(), REGISTRY, None, None)
+    base = calculate_volatile_swap_valuation(
+        make_swap(), REGISTRY, None, None, divergence_policy=TEST_POLICY
+    )
     with pytest.raises(ValueError, match="value requires its quote"):
         replace(base, **{field: UsdAmount(Decimal("100"))})
 
@@ -478,7 +514,9 @@ def test_result_rejects_forged_outgoing_market_value() -> None:
     """Both value calculations must agree with their own observed prices."""
     from dataclasses import replace
 
-    base = calculate_volatile_swap_valuation(make_swap(), REGISTRY, quote("2"), quote("1"))
+    base = calculate_volatile_swap_valuation(
+        make_swap(), REGISTRY, quote("2"), quote("1"), divergence_policy=TEST_POLICY
+    )
     with pytest.raises(ValueError, match="outgoing value must match"):
         replace(base, outgoing_value_usd=UsdAmount(Decimal("101")))
 
@@ -487,7 +525,9 @@ def test_result_rejects_spread_without_two_legs() -> None:
     """A one-sided observed quote cannot have a meaningful comparison spread."""
     from dataclasses import replace
 
-    base = calculate_volatile_swap_valuation(make_swap(), REGISTRY, None, quote("1"))
+    base = calculate_volatile_swap_valuation(
+        make_swap(), REGISTRY, None, quote("1"), divergence_policy=TEST_POLICY
+    )
     with pytest.raises(ValueError, match="spread requires two"):
         replace(base, relative_spread=Decimal("0"))
 
@@ -496,7 +536,9 @@ def test_result_rejects_spread_for_zero_price() -> None:
     """Zero-price volatile observations are never reliable cross-checks."""
     from dataclasses import replace
 
-    base = calculate_volatile_swap_valuation(make_swap(), REGISTRY, quote("0"), quote("1"))
+    base = calculate_volatile_swap_valuation(
+        make_swap(), REGISTRY, quote("0"), quote("1"), divergence_policy=TEST_POLICY
+    )
     with pytest.raises(ValueError, match="spread requires positive"):
         replace(base, relative_spread=Decimal("1"))
 
@@ -508,7 +550,9 @@ def test_result_rejects_valuation_using_incoming_as_accounting_anchor() -> None:
     from portfolio_analyzer.application.trade_valuation import calculate_swap_valuation_for_side
 
     swap = make_swap()
-    base = calculate_volatile_swap_valuation(swap, REGISTRY, quote("2"), quote("2"))
+    base = calculate_volatile_swap_valuation(
+        swap, REGISTRY, quote("2"), quote("2"), divergence_policy=TEST_POLICY
+    )
     incoming_based = calculate_swap_valuation_for_side(
         swap,
         "in",
@@ -538,5 +582,5 @@ async def test_invalid_second_provider_quote_is_not_treated_as_missing() -> None
     """Corrupt incoming API result is an error even after successful outgoing lookup."""
     fake = FakePrices({LDO: quote("2"), LINK: "broken"})  # type: ignore[dict-item]
     with pytest.raises(TypeError, match="incoming quote"):
-        await value_swap_by_volatile(make_swap(), REGISTRY, fake)
+        await value_swap_by_volatile(make_swap(), REGISTRY, fake, divergence_policy=TEST_POLICY)
     assert fake.calls == [(LDO, TX_TIME), (LINK, TX_TIME)]
