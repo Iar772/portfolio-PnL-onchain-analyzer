@@ -19,10 +19,11 @@ from portfolio_analyzer.domain.stablecoins import StablecoinRegistry
 
 
 class SwapValuationStatus(StrEnum):
-    """Explain why a swap does or does not have a known USD valuation."""
+    """Explain stablecoin or ETH/WETH anchor selection and quote availability."""
 
     VALUED = "valued"
     NO_STABLECOIN_ANCHOR = "no_stablecoin_anchor"
+    NO_ETH_ANCHOR = "no_eth_anchor"
     PRICE_UNAVAILABLE = "price_unavailable"
     PRICE_OUTSIDE_WINDOW = "price_outside_window"
 
@@ -32,11 +33,12 @@ class SwapUsdValuation:
     """Keep one trade USD value for two accounting uses.
 
     :param swap: Original economic event, without modifying its meaning.
-    :param anchor_asset_id: Trusted asset chosen as the quote anchor, if any.
+    :param anchor_asset_id: Trade leg selected as valuation anchor, if any.
     :param anchor_side: Whether that asset was outgoing or incoming.
     :param quote: Observed historical market quote, if provided.
     :param value_usd: One shared USD amount, or None when unknown.
     :param status: Explicit valuation outcome (never unknown as zero).
+    :param pricing_asset_id: Asset actually quoted by the price provider, if known.
     :raises TypeError: If field types are inconsistent.
     :raises ValueError: If a known/unknown valuation is contradictory.
     """
@@ -47,6 +49,7 @@ class SwapUsdValuation:
     quote: PriceQuote | None
     value_usd: UsdAmount | None
     status: SwapValuationStatus
+    pricing_asset_id: AssetId | None = None
 
     def __post_init__(self) -> None:
         """Protect the accounting result from contradictory construction.
@@ -60,6 +63,8 @@ class SwapUsdValuation:
             raise TypeError("status must be SwapValuationStatus")
         if self.anchor_asset_id is not None and not isinstance(self.anchor_asset_id, AssetId):
             raise TypeError("anchor_asset_id must be AssetId or None")
+        if self.pricing_asset_id is not None and not isinstance(self.pricing_asset_id, AssetId):
+            raise TypeError("pricing_asset_id must be AssetId or None")
         if self.quote is not None and not isinstance(self.quote, PriceQuote):
             raise TypeError("quote must be PriceQuote or None")
         if self.value_usd is not None and not isinstance(self.value_usd, UsdAmount):
@@ -87,15 +92,24 @@ class SwapUsdValuation:
                 raise ValueError("value_usd must match the selected leg and its quote")
         elif self.value_usd is not None:
             raise ValueError("unknown swaps must not have a USD value")
-        if self.status is SwapValuationStatus.NO_STABLECOIN_ANCHOR:
+        if self.status in (
+            SwapValuationStatus.NO_STABLECOIN_ANCHOR,
+            SwapValuationStatus.NO_ETH_ANCHOR,
+        ):
             if (
                 self.anchor_asset_id is not None
                 or self.anchor_side is not None
                 or self.quote is not None
+                or self.pricing_asset_id is not None
             ):
                 raise ValueError("unanchored swaps cannot contain anchor provenance")
         elif self.anchor_side is None or self.anchor_asset_id is None:
             raise ValueError("anchored statuses require a selected asset")
+        if self.pricing_asset_id is not None:
+            if self.anchor_asset_id is None:
+                raise ValueError("pricing asset requires an anchor")
+            if self.pricing_asset_id.chain_id != self.anchor_asset_id.chain_id:
+                raise ValueError("pricing asset must be on the same chain as anchor")
         if self.status is SwapValuationStatus.PRICE_UNAVAILABLE and self.quote is not None:
             raise ValueError("unavailable prices cannot have a quote")
         if self.status is SwapValuationStatus.PRICE_OUTSIDE_WINDOW and self.quote is None:
@@ -148,7 +162,7 @@ def select_stablecoin_side(swap: Swap, registry: StablecoinRegistry) -> Literal[
     return None
 
 
-def _require_quote_window(max_distance: timedelta) -> None:
+def validate_quote_window(max_distance: timedelta) -> None:
     """Validate the maximum acceptable historical observation drift.
 
     :param max_distance: Allowed absolute distance from the swap timestamp.
@@ -196,27 +210,97 @@ def calculate_stablecoin_swap_valuation(
     :raises TypeError: For invalid types.
     :raises ValueError: For invalid quote window.
     """
-    _require_quote_window(max_distance)
     side = select_stablecoin_side(swap, registry)
+    return calculate_swap_valuation_for_side(
+        swap,
+        side,
+        quote,
+        missing_anchor_status=SwapValuationStatus.NO_STABLECOIN_ANCHOR,
+        max_distance=max_distance,
+        pricing_asset_id=(swap.amount_out.asset_id if side == "out" else swap.amount_in.asset_id)
+        if side is not None
+        else None,
+    )
+
+
+def calculate_swap_valuation_for_side(
+    swap: Swap,
+    side: Literal["out", "in"] | None,
+    quote: PriceQuote | None,
+    *,
+    missing_anchor_status: SwapValuationStatus,
+    max_distance: timedelta = timedelta(minutes=15),
+    pricing_asset_id: AssetId | None = None,
+) -> SwapUsdValuation:
+    """Value one selected leg using a single historical USD observation.
+
+    Shared by stablecoin and ETH/WETH valuation. Anchor selection and price
+    source are decided by callers; this function owns the consistency rules.
+
+    :param swap: Classified two-asset swap.
+    :param side: Selected outgoing/incoming side or None when unsupported.
+    :param quote: Historical USD observation, or None when missing.
+    :param missing_anchor_status: Explicit reason no eligible side exists.
+    :param max_distance: Maximum absolute timestamp difference.
+    :param pricing_asset_id: Identity queried for the quote, which may differ
+        from the anchor only for explicit proxy pricing (such as WETH via ETH).
+    :return: One shared proceeds/basis value, or an unknown valuation.
+    :raises TypeError: For invalid event, quote, or anchor types.
+    :raises ValueError: For contradictory or unsupported inputs.
+    """
+    if not isinstance(swap, Swap):
+        raise TypeError("swap must be a Swap")
+    validate_quote_window(max_distance)
+    if not isinstance(missing_anchor_status, SwapValuationStatus):
+        raise TypeError("missing_anchor_status must be SwapValuationStatus")
+    if missing_anchor_status not in (
+        SwapValuationStatus.NO_STABLECOIN_ANCHOR,
+        SwapValuationStatus.NO_ETH_ANCHOR,
+    ):
+        raise ValueError("missing_anchor_status must describe no selected anchor")
     if quote is not None and not isinstance(quote, PriceQuote):
         raise TypeError("quote must be PriceQuote or None")
+    if pricing_asset_id is not None and not isinstance(pricing_asset_id, AssetId):
+        raise TypeError("pricing_asset_id must be AssetId or None")
     if side is None:
-        return SwapUsdValuation(
-            swap, None, None, None, None, SwapValuationStatus.NO_STABLECOIN_ANCHOR
-        )
+        if pricing_asset_id is not None:
+            raise ValueError("unanchored swap must not specify a pricing asset")
+        return SwapUsdValuation(swap, None, None, None, None, missing_anchor_status)
+    if side not in ("out", "in"):
+        raise ValueError("side must be 'out', 'in' or None")
 
-    amount: AssetAmount = swap.amount_out if side == "out" else swap.amount_in
+    amount = swap.amount_out if side == "out" else swap.amount_in
+    if pricing_asset_id is not None and pricing_asset_id.chain_id != amount.asset_id.chain_id:
+        raise ValueError("pricing asset must be on the same chain as selected amount")
     if quote is None:
         return SwapUsdValuation(
-            swap, amount.asset_id, side, None, None, SwapValuationStatus.PRICE_UNAVAILABLE
+            swap,
+            amount.asset_id,
+            side,
+            None,
+            None,
+            SwapValuationStatus.PRICE_UNAVAILABLE,
+            pricing_asset_id=pricing_asset_id,
         )
     if abs(quote.observed_at - swap.metadata.timestamp) > max_distance:
         return SwapUsdValuation(
-            swap, amount.asset_id, side, quote, None, SwapValuationStatus.PRICE_OUTSIDE_WINDOW
+            swap,
+            amount.asset_id,
+            side,
+            quote,
+            None,
+            SwapValuationStatus.PRICE_OUTSIDE_WINDOW,
+            pricing_asset_id=pricing_asset_id,
         )
-
-    value = _usd_value(amount, quote)
-    return SwapUsdValuation(swap, amount.asset_id, side, quote, value, SwapValuationStatus.VALUED)
+    return SwapUsdValuation(
+        swap,
+        amount.asset_id,
+        side,
+        quote,
+        _usd_value(amount, quote),
+        SwapValuationStatus.VALUED,
+        pricing_asset_id=pricing_asset_id,
+    )
 
 
 async def value_swap_by_stablecoin(
@@ -240,7 +324,7 @@ async def value_swap_by_stablecoin(
     :raises TypeError: For invalid model inputs or provider results.
     :raises ValueError: For invalid observation window.
     """
-    _require_quote_window(max_distance)
+    validate_quote_window(max_distance)
     side = select_stablecoin_side(swap, registry)
     if side is None:
         return calculate_stablecoin_swap_valuation(swap, registry, None, max_distance=max_distance)
