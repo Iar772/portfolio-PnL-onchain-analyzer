@@ -1,4 +1,4 @@
-"""Conservative swap USD valuation from an explicitly trusted stablecoin leg.
+"""Shared conservative swap USD valuation for trusted historical price anchors.
 
 A single observed USD value is reused for both disposal proceeds and acquired
 basis. This module does not create FIFO lots or recognize taxable disposals.
@@ -19,11 +19,14 @@ from portfolio_analyzer.domain.stablecoins import StablecoinRegistry
 
 
 class SwapValuationStatus(StrEnum):
-    """Explain stablecoin or ETH/WETH anchor selection and quote availability."""
+    """Explain stablecoin, ETH/WETH, or volatile anchor price outcomes."""
 
     VALUED = "valued"
     NO_STABLECOIN_ANCHOR = "no_stablecoin_anchor"
     NO_ETH_ANCHOR = "no_eth_anchor"
+    NO_VOLATILE_PAIR = "no_volatile_pair"
+    VOLATILE_PRICE_UNRELIABLE = "volatile_price_unreliable"
+    VOLATILE_PRICE_DISAGREEMENT = "volatile_price_disagreement"
     PRICE_UNAVAILABLE = "price_unavailable"
     PRICE_OUTSIDE_WINDOW = "price_outside_window"
 
@@ -95,6 +98,7 @@ class SwapUsdValuation:
         if self.status in (
             SwapValuationStatus.NO_STABLECOIN_ANCHOR,
             SwapValuationStatus.NO_ETH_ANCHOR,
+            SwapValuationStatus.NO_VOLATILE_PAIR,
         ):
             if (
                 self.anchor_asset_id is not None
@@ -256,6 +260,7 @@ def calculate_swap_valuation_for_side(
     if missing_anchor_status not in (
         SwapValuationStatus.NO_STABLECOIN_ANCHOR,
         SwapValuationStatus.NO_ETH_ANCHOR,
+        SwapValuationStatus.NO_VOLATILE_PAIR,
     ):
         raise ValueError("missing_anchor_status must describe no selected anchor")
     if quote is not None and not isinstance(quote, PriceQuote):
