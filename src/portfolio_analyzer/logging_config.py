@@ -48,6 +48,8 @@ class JsonEventFormatter(logging.Formatter):
             "movement_count",
             "token_count",
             "unresolved_count",
+            "http_attempts",
+            "cache_hit_count",
         ):
             field_value = getattr(record, field_name, None)
             if type(field_value) is not int or field_value < 0:

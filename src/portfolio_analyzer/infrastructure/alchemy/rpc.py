@@ -21,6 +21,7 @@ from portfolio_analyzer.application.provider_errors import (
     ProviderUnavailableError,
     should_retry_provider_error,
 )
+from portfolio_analyzer.application.run_guardrails import AnalysisRunStopped, RunGuardrails
 from portfolio_analyzer.domain.assets import AssetAmount, AssetId, AssetMetadata
 from portfolio_analyzer.ethereum.rpc_models import RpcBlock, RpcLog, RpcReceipt, RpcTransaction
 
@@ -200,6 +201,7 @@ class AlchemyRpcProvider:
     :param base_backoff: Initial retry backoff in seconds.
     :param max_backoff: Maximum retry backoff in seconds.
     :param sleep: Injectable async sleep for deterministic unit tests.
+    :param guardrails: Optional per-analysis shared request cap and usage diagnostics.
     """
 
     def __init__(
@@ -213,6 +215,7 @@ class AlchemyRpcProvider:
         base_backoff: float = 0.5,
         max_backoff: float = 4.0,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        guardrails: RunGuardrails | None = None,
     ) -> None:
         """Bind a shared client and validate bounded I/O settings.
 
@@ -224,6 +227,7 @@ class AlchemyRpcProvider:
         :param base_backoff: Nonnegative initial backoff.
         :param max_backoff: Nonnegative maximum backoff.
         :param sleep: Async sleep dependency.
+        :param guardrails: Shared optional per-run request guardrails.
         :raises ValueError: If configuration is invalid.
         :raises TypeError: If client has the wrong type.
         """
@@ -247,6 +251,9 @@ class AlchemyRpcProvider:
             )
         ):
             raise ValueError("timeout/backoff must be finite and nonnegative")
+        if guardrails is not None and not isinstance(guardrails, RunGuardrails):
+            raise TypeError("guardrails must be RunGuardrails or None")
+        self._guardrails = guardrails
         self._client = client
         self._url = f"https://eth-mainnet.g.alchemy.com/v2/{api_key}"
         self._prices_url = f"https://api.g.alchemy.com/prices/v1/{api_key}/tokens"
@@ -257,6 +264,14 @@ class AlchemyRpcProvider:
         self._max_backoff = float(max_backoff)
         self._sleep = sleep
         self._request_ids = itertools.count(1)
+
+    @property
+    def run_guardrails(self) -> RunGuardrails | None:
+        """Expose shared per-analysis metrics to sibling infrastructure adapters.
+
+        :return: Configured guardrails, or None for legacy/test callers.
+        """
+        return self._guardrails
 
     async def _execute_http(
         self,
@@ -279,10 +294,20 @@ class AlchemyRpcProvider:
             started = time.perf_counter()
             context = {"provider": "alchemy", "operation": operation, "attempt": attempt}
             _LOGGER.debug("provider_request_started", extra=context)
+            reserved = False
+            successful = False
             try:
                 async with self._semaphore:
+                    # Reserve only after obtaining a concurrency slot. Both
+                    # retries and the first attempt consume the shared budget.
+                    if self._guardrails is not None:
+                        await self._guardrails.reserve_http_attempt(
+                            operation=operation, is_retry=attempt > 1
+                        )
+                        reserved = True
                     response = await asyncio.wait_for(send(), timeout=self._timeout)
                 if response.status_code == 404 and not_found_returns_none:
+                    successful = True
                     _LOGGER.debug(
                         "provider_request_completed",
                         extra={
@@ -300,6 +325,7 @@ class AlchemyRpcProvider:
                 if response.status_code >= 400:
                     raise ProviderError("alchemy", operation)
                 result = decode(response)
+                successful = True
                 _LOGGER.debug(
                     "provider_request_completed",
                     extra={
@@ -308,12 +334,26 @@ class AlchemyRpcProvider:
                     },
                 )
                 return result
+            except AnalysisRunStopped as exc:
+                _LOGGER.warning(
+                    "analysis_run_stopped",
+                    extra={
+                        **context,
+                        "http_attempts": exc.snapshot.http_attempts,
+                        "cache_hit_count": exc.snapshot.historical_cache_hits,
+                    },
+                )
+                raise
             except (httpx.TimeoutException, TimeoutError):
                 failure: ProviderError = ProviderTimeoutError("alchemy", operation)
             except httpx.TransportError:
                 failure = ProviderUnavailableError("alchemy", operation)
             except ProviderError as exc:
                 failure = exc
+            finally:
+                # Also count cancellation of an already reserved attempt.
+                if reserved and self._guardrails is not None:
+                    self._guardrails.record_http_completion(success=successful)
             failure_context = {
                 **context,
                 "failure_kind": _failure_kind(failure),

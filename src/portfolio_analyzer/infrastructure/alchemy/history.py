@@ -10,6 +10,7 @@ from portfolio_analyzer.application.provider_errors import (
     ProviderMalformedResponseError,
     ProviderPartialResultError,
 )
+from portfolio_analyzer.application.run_guardrails import AnalysisRunStopped
 from portfolio_analyzer.domain.assets import AssetId
 from portfolio_analyzer.ethereum.movements import AssetMovement, MovementCategory
 from portfolio_analyzer.infrastructure.alchemy.rpc import (
@@ -208,6 +209,12 @@ class AlchemyHistoryProvider:
                 if cursor and not parsed:
                     raise ProviderPartialResultError("alchemy", _OPERATION)
                 results.extend(parsed)
+                if self._rpc.run_guardrails is not None:
+                    self._rpc.run_guardrails.record_progress(
+                        stage=f"history_{direction}",
+                        pages_completed=page_num + 1,
+                        items_seen=len(results),
+                    )
                 if not cursor:
                     _LOGGER.info(
                         "history_direction_completed",
@@ -224,6 +231,18 @@ class AlchemyHistoryProvider:
                     raise ProviderPartialResultError("alchemy", _OPERATION)
                 seen_cursors.add(cursor)
                 params["pageKey"] = cursor
+            except AnalysisRunStopped:
+                _LOGGER.warning(
+                    "history_incomplete",
+                    extra={
+                        "provider": "alchemy",
+                        "operation": _OPERATION,
+                        "direction": direction,
+                        "page_count": page_num,
+                        "movement_count": len(results),
+                    },
+                )
+                raise
             except ProviderError as exc:
                 _LOGGER.warning(
                     "history_incomplete",
